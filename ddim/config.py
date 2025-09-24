@@ -32,7 +32,7 @@ PREPROCESS_NUM_WORKERS = 8
 INFERENCE_NUM_WORKERS = 8
 
 INFERENCE_BATCH_SIZE = 32
-MODEL_PATH="weights/conditional_unet_checkpoint.pth" # Path to model weights for inference
+MODEL_PATH="weights/trained_weights_500epochs_ConditionalUNet2DViT.pth" # Path to model weights for inference
 
 LOSS_TYPE = "simple" # atm simple only
 MODEL_DIM = "2D"
