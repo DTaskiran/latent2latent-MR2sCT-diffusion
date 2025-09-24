@@ -1,0 +1,16 @@
+[project]
+name = "latent2latent-mr2sct-diffusion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "diffusers>=0.35.1",
+    "matplotlib>=3.10.6",
+    "monai[einops]>=1.5.1",
+    "numpy>=2.3.3",
+    "scipy>=1.16.2",
+    "simpleitk>=2.5.2",
+    "torch>=2.8.0",
+    "tqdm>=4.67.1",
+]
