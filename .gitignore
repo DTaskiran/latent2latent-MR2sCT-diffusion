@@ -1,3 +1,8 @@
+# Scans and preprocesses volumes / slices
+*.npy
+*.nii
+*.mha
+ 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
