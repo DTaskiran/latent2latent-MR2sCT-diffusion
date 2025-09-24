@@ -1,0 +1,209 @@
+import os
+import json
+import numpy as np
+import scipy
+from tqdm import tqdm
+import torch
+import SimpleITK as sitk
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+from ddim.dataset import MRISCTDataset
+from ddim.model import ConditionalUNet2DViT
+from ddim.config import (
+    MODEL_PATH,
+    INFERENCE_BATCH_SIZE,
+    INFERENCE_NUM_WORKERS,
+    NUM_INFER_STEPS,
+    ORIGINAL_DATA_ROOT,
+    OUTPUT_DIR,
+    PREPROCESSED_DATA_ROOT,
+    DEVICE,
+)
+from ddim.utils.schedule_utils import setup_scheduler
+
+def denormalize_ct(ct_norm: np.ndarray, ct_min: float, ct_max: float) -> np.ndarray:
+    return ct_norm * (ct_max - ct_min) + ct_min
+
+def normalize_for_display(image):
+    image = np.copy(image)
+    return (image - np.min(image)) / (np.max(image) - np.min(image) + 1e-8)
+
+def infer_and_save(model_path=MODEL_PATH):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    dataset = MRISCTDataset(
+        mode="infer",
+        use_preprocessed=True,
+        )
+    
+    loader = DataLoader(dataset, batch_size=INFERENCE_BATCH_SIZE, shuffle=False, num_workers=INFERENCE_NUM_WORKERS)
+
+    model = ConditionalUNet2DViT().to(DEVICE)
+    print('Compiling the model ...')
+    model = torch.compile(model).to(DEVICE)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+
+    scheduler = setup_scheduler()
+    scheduler.set_timesteps(NUM_INFER_STEPS) 
+    #autocast_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    autocast_dtype = torch.float32 # bf16 does not work on RTX 2080 Ti
+    print(f'Using autocast dtype {autocast_dtype}')
+    volume_slices = {}
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Inferring", leave=False):
+            mri = batch["mri"].to(DEVICE)  # [B, 1, H, W]
+            v_idxs = batch["patient_idx"].tolist()
+            slice_idxs = batch["slice_idx"].tolist()
+            patient_ids = [dataset.patient_ids_loaded[i] for i in v_idxs]
+
+            x_t = torch.randn_like(mri)    
+
+            for t in tqdm(scheduler.timesteps, desc="Steps", leave=False):
+                ts = torch.full((x_t.shape[0],), t.item(), device=DEVICE, dtype=torch.long)
+                
+                with torch.autocast(device_type=DEVICE.split(":")[0], dtype=autocast_dtype):
+                    noise_pred = model(x_t, ts, mri)
+                x_t = scheduler.step(noise_pred, t, x_t).prev_sample
+            
+            # synthetic CT is now in range [-1, 1], but real latent CT is in range [-2, 2]
+            # x_t = x_t * 2  # Scale to match the original latent CT range
+            # x_t = torch.clamp(x_t, -2, 2)
+            x_t = torch.clamp(x_t, -1, 1)
+            
+            #synth_batch = x_t.cpu().numpy().squeeze(1)  # shape: [B, H, W]
+            synth_batch = x_t.cpu().numpy()
+            
+            #mri_batch_np = mri.cpu().numpy().squeeze(1) ## TODO: FIX - Not the original MRI slices but the preprocessed...
+            mri_batch_np = mri.cpu().numpy()
+            # print(f'{synth_batch.min()=}, {synth_batch.max()=}')
+            
+            ## TODO: check - for 2.5D - maybe? mri_batch_np = mri[:, 0].cpu().numpy() 
+
+            for i in range(len(patient_ids)):
+                pid = patient_ids[i]
+                slice_idx = slice_idxs[i]
+                mri_np = mri_batch_np[i]
+                synth_slice = synth_batch[i]
+                
+                # save the synthesized slice as a nifti volume
+                im = sitk.GetImageFromArray(synth_slice * 2)
+                im.SetSpacing((1.0, 1.0, 1.0))
+                im.SetOrigin((0.0, 0.0, 0.0))
+                im.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+                output_path = os.path.join(OUTPUT_DIR, pid, "time_steps", str(NUM_INFER_STEPS), f"{pid}_slice_{slice_idx:03d}.nii")
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                sitk.WriteImage(im, output_path)
+                print(f"💾 Synthesized slice saved: {output_path}")               
+                
+                # If the output is multi-channel, select the first 3 channels
+                
+                
+                if mri_np.shape[0] > 3:
+                    mri_np = mri_np[:3]
+                if synth_slice.shape[0] > 3:
+                    synth_slice = synth_slice[:3]
+           
+                # Save QA PNG
+                save_QA(pid, slice_idx, mri_np, synth_slice)
+
+
+    # Reconstruct & save 3D volumes
+    for patient_id, slices_dict in volume_slices.items():
+        patient_folder = os.path.join(OUTPUT_DIR, patient_id, "time_steps", str(NUM_INFER_STEPS))
+        meta_path = os.path.join(PREPROCESSED_DATA_ROOT, patient_id, "meta.json")
+        mri_ref_path = os.path.join(ORIGINAL_DATA_ROOT, f"{patient_id}_latent_mr.nii")
+
+        # Read black slice indices
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+                black_slices = set(meta.get("black_slice_indices", []))
+        else:
+            black_slices = set()
+
+        # --- Step 1: Determine slice range ---
+        if not slices_dict:
+            print(f"❌ No predicted slices for {patient_id}")
+            continue
+
+        min_idx = min(slices_dict.keys())
+        max_idx = max(slices_dict.keys())
+        real_slices = [slices_dict[i] for i in range(min_idx, max_idx + 1) if i in slices_dict]
+
+        # --- Step 2: Resample real predicted volume only ---
+        real_volume = np.stack(real_slices, axis=0)  # [D, H, W]
+        mri_img = sitk.ReadImage(mri_ref_path, sitk.sitkFloat32)
+        mri_arr = sitk.GetArrayFromImage(mri_img)
+        zoom_factors = [r / s for r, s in zip(mri_arr.shape, real_volume.shape)]
+        print(f"🔁 Resampling only predicted slices for {patient_id} | Zoom: {zoom_factors}")
+
+        upsampled = scipy.ndimage.zoom(real_volume, zoom=zoom_factors, order=1)
+
+        # --- Step 3: Map resampled slices back to full volume (insert black slices) ---
+        total_slices = mri_arr.shape[0]
+        full_volume = []
+        up_idx = 0  # index in upsampled
+        for i in range(total_slices):
+            if i in black_slices or i < min_idx or i > max_idx or i not in slices_dict:
+                full_volume.append(np.full((upsampled.shape[1], upsampled.shape[2]), ct_min, dtype=np.float32))
+            else:
+                full_volume.append(upsampled[up_idx])
+                up_idx += 1
+
+        volume_np = np.stack(full_volume, axis=0)
+        volume_img = sitk.GetImageFromArray(volume_np)
+        volume_img.CopyInformation(mri_img)
+
+        # --- Step 4: Save output ---
+        volume_path = os.path.join(patient_folder, f"{patient_id}_synth_volume.mha")
+        sitk.WriteImage(volume_img, volume_path)
+        print(f"💾 Volume saved for {patient_id} → {volume_path}")
+
+
+    print(f"\n✅ All patient outputs saved in: {OUTPUT_DIR}")
+
+def save_QA(pid, slice_idx, mri_np, synth_slice):
+    patient_folder = os.path.join(OUTPUT_DIR, pid, "time_steps", str(NUM_INFER_STEPS))
+    os.makedirs(patient_folder, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(f"Patient: {pid} | Slice: {slice_idx}\n", fontsize=14)
+
+    mri_np = (mri_np + 1) / 2
+    # print("mri_min, mri_max:", mri_np.min(), mri_np.max())
+    axes[0].imshow(np.transpose(mri_np, (1, 2, 0)))
+    axes[0].set_title("MRI Slice")
+    axes[0].axis("off")
+
+    synth_slice = (synth_slice + 1) / 2
+    #print("synth_min, synth_max:", synth_slice.min(), synth_slice.max())
+    axes[1].imshow(np.transpose(synth_slice, (1, 2, 0)))
+    axes[1].set_title("Synthetic CT")
+    axes[1].axis("off")
+
+    ct_path = os.path.join(PREPROCESSED_DATA_ROOT, f"{pid}_latent_ct.npy")
+    if os.path.exists(ct_path):
+        ct_vol = np.load(ct_path)
+        ct_slice = ct_vol[slice_idx] if slice_idx < ct_vol.shape[0] else None
+        
+        # take the first three channels if multi-channel
+        if ct_slice.ndim == 3 and ct_slice.shape[0] > 3:
+            ct_slice = ct_slice[:, :, :3]
+        ct_slice = (ct_slice + 1) / 2
+        #print("ct_min, ct_max:", ct_slice.min(), ct_slice.max())
+        axes[2].imshow(ct_slice)
+        axes[2].set_title("Original CT Slice")
+        axes[2].axis("off")
+        
+
+    plt.tight_layout()
+    qa_path = os.path.join(patient_folder, f"slice_{slice_idx:03d}_qa.png")
+    plt.savefig(qa_path, bbox_inches="tight")
+    plt.close()
+    print(f"🧪 QA PNG saved: {qa_path}")    
+
+if __name__ == "__main__":
+    print("🔍 Starting inference...")
+    infer_and_save()
